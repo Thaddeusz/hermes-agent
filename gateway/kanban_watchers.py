@@ -1517,6 +1517,71 @@ class GatewayKanbanWatchersMixin:
                 _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                # Triage clarification (task t_e647d476): park fresh triage
+                # cards by generating questions, and time out parked cards
+                # whose deadline has passed. Re-reads ``kanban.triage_clarify``
+                # each tick (same safety-toggle pattern as auto-decompose) so
+                # flipping ``enabled`` takes effect on the next tick without
+                # a gateway restart. Disabled by default — operator opts in
+                # once smoke testing is done.
+                #
+                # ``self`` is not visible inside the ``asyncio.to_thread``
+                # closure (the worker runs on a thread-pool executor with
+                # no implicit reference to the gateway instance), so we
+                # capture the WhatsApp adapter lookup as a closure bound
+                # to the current tick. The lookup is best-effort — a
+                # missing / uninitialised adapter falls through to a
+                # silent no-op, which is fine because the durable record
+                # lives in ``pending_clarifications.json``.
+                def _triage_clarify_whatsapp_sender(recipient, message):
+                    try:
+                        # ``self`` is the gateway instance (the
+                        # ``GatewayKanbanWatchersMixin`` sits on top
+                        # of it via the MRO). ``adapters`` and the
+                        # ``Platform`` enum live on the gateway side,
+                        # not on the mixin, so they aren't visible
+                        # to type checkers from this file. Resolve
+                        # them defensively rather than relying on
+                        # mixin-side imports — this keeps the closure
+                        # safe even if the mixin ever gets reused by
+                        # a runner that doesn't expose ``adapters``.
+                        adapters = getattr(self, "adapters", None) or {}
+                        if not adapters:
+                            return False
+                        try:
+                            from gateway.config import Platform as _Platform
+                            wa_constant = _Platform.WHATSAPP
+                        except Exception:
+                            return False
+                        adapter = adapters.get(wa_constant)
+                    except Exception:
+                        return False
+                    if adapter is None:
+                        return False
+                    try:
+                        adapter.send_message(chat_id=recipient, text=message)
+                        return True
+                    except Exception:
+                        return False
+                try:
+                    from gateway.triage_clarify_watcher import triage_clarify_tick
+                    _tc_stats = await asyncio.to_thread(
+                        triage_clarify_tick, _load_config, _kb.list_boards, _kb.connect,
+                        whatsapp_sender=_triage_clarify_whatsapp_sender,
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: triage_clarify tick crashed"
+                    )
+                    _tc_stats = {"asked": 0, "timed_out": 0, "boards_visited": 0}
+                if _tc_stats.get("asked") or _tc_stats.get("timed_out"):
+                    logger.info(
+                        "kanban dispatcher: triage_clarify asked=%d timed_out=%d "
+                        "boards_visited=%d",
+                        _tc_stats.get("asked", 0),
+                        _tc_stats.get("timed_out", 0),
+                        _tc_stats.get("boards_visited", 0),
+                    )
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
