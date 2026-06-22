@@ -1511,12 +1511,6 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Re-read the auto-decompose toggle live each tick so a user
-                # flipping kanban.auto_decompose=false to STOP runaway fan-out
-                # takes effect on the next tick, not on gateway restart (#49638).
-                _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                if _ad_enabled:
-                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 # Triage clarification (task t_e647d476): park fresh triage
                 # cards by generating questions, and time out parked cards
                 # whose deadline has passed. Re-reads ``kanban.triage_clarify``
@@ -1524,6 +1518,17 @@ class GatewayKanbanWatchersMixin:
                 # flipping ``enabled`` takes effect on the next tick without
                 # a gateway restart. Disabled by default — operator opts in
                 # once smoke testing is done.
+                #
+                # **Runs BEFORE auto-decompose** to avoid a race where a
+                # fresh triage card lands in the column and gets decomposed
+                # in the same dispatcher tick before the watcher has a
+                # chance to park it in ``awaiting_clarification``. Once
+                # parked, ``list_triage_ids()`` no longer returns the card
+                # (status filter excludes ``awaiting_clarification``), so
+                # the auto-decomposer correctly skips it. Observed bug:
+                # triage card t_14f9193c decomposed 74s after entering
+                # triage on 2026-06-22 because the watcher had not yet
+                # ticked.
                 #
                 # ``self`` is not visible inside the ``asyncio.to_thread``
                 # closure (the worker runs on a thread-pool executor with
@@ -1582,6 +1587,14 @@ class GatewayKanbanWatchersMixin:
                         _tc_stats.get("timed_out", 0),
                         _tc_stats.get("boards_visited", 0),
                     )
+                # Auto-decompose runs AFTER triage_clarify so cards parked
+                # by the watcher in this tick are invisible to
+                # ``list_triage_ids()`` (status filter excludes
+                # ``awaiting_clarification``). See the race-condition note
+                # above the triage_clarify block.
+                _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
+                if _ad_enabled:
+                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
