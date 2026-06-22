@@ -107,6 +107,241 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Default WhatsApp notify subscription (task t_1b1c730a)
+# ---------------------------------------------------------------------------
+#
+# The user-visible feature: when ``kanban.notifications.enabled`` is on
+# and a destination (currently WhatsApp) is configured, a single sentinel
+# subscription row (``task_id = "__default__"``, ``is_default = 1``) is
+# installed and broadcasts status-change events (``blocked``,
+# ``awaiting_clarification``, ``review``) for every card to the operator's
+# self-chat. This is the default — users who want finer control can still
+# ``kanban_notify-subscribe`` individual tasks; the two systems share an
+# adapter but have independent cursors, so per-task subs continue to work
+# alongside the default.
+#
+# Helpers below are deliberately module-level so they can be unit-tested
+# without instantiating a GatewayRunner (which has heavy deps). The
+# watcher calls them from the asyncio.to_thread collector.
+
+
+# Kinds the default sub forwards. Narrower than the per-task terminal set:
+# the spec only wants status changes that need operator attention, not
+# every dispatcher event.
+DEFAULT_NOTIFY_KINDS = ("blocked", "awaiting_clarification", "review")
+
+
+def _resolve_default_notify_target(cfg: dict) -> Optional[dict]:
+    """Read the WhatsApp destination from ``kanban.notifications`` config.
+
+    Returns ``None`` when notifications are disabled or the WhatsApp
+    destination has no ``chat_id`` — the watcher treats that as "skip
+    install". Defensive against partial / malformed config: every key is
+    fetched with ``.get(..., default)`` and type-checked.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    kanban_cfg = cfg.get("kanban") or {}
+    notif = kanban_cfg.get("notifications") or {}
+    if not isinstance(notif, dict) or not notif.get("enabled", False):
+        return None
+    destinations = notif.get("destinations") or {}
+    if not isinstance(destinations, dict):
+        return None
+    whatsapp = destinations.get("whatsapp") or {}
+    if not isinstance(whatsapp, dict):
+        return None
+    chat_id = (whatsapp.get("chat_id") or "").strip()
+    if not chat_id:
+        return None
+    return {
+        "platform": "whatsapp",
+        "chat_id": chat_id,
+        "thread_id": whatsapp.get("thread_id") or None,
+        "notifier_profile": (
+            (whatsapp.get("profile") or "").strip() or None
+        ),
+        "template": (
+            whatsapp.get("template")
+            or (
+                "🔔 Kanban: {task_id} {title}\n"
+                "Status: {new_status}\n"
+                "Reason: {block_reason}\n"
+                "Workspace: {workspace_path}"
+            )
+        ),
+    }
+
+
+def _install_default_notify_sub_from_config(cfg: dict) -> None:
+    """Sync installer: upsert / remove the sentinel default sub row.
+
+    Reads the config, connects to the kanban DB, and idempotently
+    installs the row when enabled, or removes it when disabled. Safe to
+    call on every tick (the underlying DB functions are idempotent);
+    doing it per-tick is what lets a config edit take effect without a
+    gateway restart.
+    """
+    from hermes_cli import kanban_db as _kb
+    target = _resolve_default_notify_target(cfg)
+    conn = None
+    try:
+        conn = _kb.connect()
+    except Exception as exc:
+        logger.debug("kanban notifier: cannot connect for default sub install: %s", exc)
+        return
+    try:
+        if target is None:
+            try:
+                _kb.remove_default_notify_sub(conn)
+            except Exception as exc:
+                logger.debug("kanban notifier: remove_default_notify_sub failed: %s", exc)
+            return
+        try:
+            _kb.ensure_default_notify_sub(
+                conn,
+                platform=target["platform"],
+                chat_id=target["chat_id"],
+                thread_id=target["thread_id"],
+                notifier_profile=target["notifier_profile"],
+            )
+        except Exception as exc:
+            logger.warning("kanban notifier: default sub install failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _render_notify_template(template: str, fields: dict) -> str:
+    """Safe ``str.format`` for the user-configurable notify template.
+
+    Uses ``str.format_map`` with a defensive fallback: missing keys are
+    left as empty strings rather than raising ``KeyError``. ``format_map``
+    accepts any mapping subclass, so we wrap ``fields`` with a tolerant
+    proxy that returns ``""`` for unknown keys instead of the default
+    ``KeyError``. The placeholder text in the message stays readable
+    even when a worker omits ``block_reason`` or ``workspace_path``.
+    """
+    if not template:
+        return ""
+
+    class _Tolerant(dict):
+        def __missing__(self, key):  # type: ignore[override]
+            return ""
+
+    try:
+        return template.format_map(_Tolerant(fields))
+    except Exception:
+        # Defensive: a malformed template (e.g. unbalanced braces) shouldn't
+        # crash the notifier; fall back to a flat concatenation of the raw
+        # values so the operator at least sees the data.
+        return " ".join(str(v) for v in fields.values() if v)
+
+
+def _default_sub_template_fields(
+    template: str,
+    *,
+    task_id: str,
+    title: str,
+    new_status: str,
+    block_reason: str = "",
+    workspace_path: str = "",
+    comment_excerpt: str = "",
+) -> dict:
+    """Map the named placeholders the notify template uses.
+
+    The defaults config ships ``{task_id} {title} {new_status}
+    {block_reason} {workspace_path}``. Tests can pass a ``comment_excerpt``
+    to also exercise that field (it isn't in the v1 default template but
+    is a forward-compat placeholder users might add).
+    """
+    return {
+        "task_id": task_id,
+        "title": title,
+        "new_status": new_status,
+        "block_reason": block_reason,
+        "workspace_path": workspace_path,
+        "comment_excerpt": comment_excerpt,
+    }
+
+
+def _default_sub_collect_for_slug(
+    slug: str,
+    cfg: dict,
+    active_platforms: set,
+    deliveries: list,
+) -> None:
+    """Collect default-sub broadcasts for one board into ``deliveries``.
+
+    Appends one delivery dict per task that has unseen matching events.
+    Used by ``_kanban_notifier_watcher``'s collector closure to keep
+    that closure from becoming an unreadable nest of try/excepts. All
+    errors are caught and logged at DEBUG — the per-task delivery loop
+    must keep running even if the default-sub path trips on a transient
+    DB error.
+    """
+    from hermes_cli import kanban_db as _kb
+    default_target = _resolve_default_notify_target(cfg)
+    if default_target is None:
+        return
+    if "whatsapp" not in active_platforms:
+        return
+    conn = None
+    try:
+        conn = _kb.connect(board=slug)
+    except Exception as exc:
+        logger.debug(
+            "kanban notifier: cannot connect for default sub claim on %s: %s",
+            slug, exc,
+        )
+        return
+    try:
+        default_subs = _kb.list_notify_subs(conn, include_default=True)
+        default_sub = next(
+            (
+                s for s in default_subs
+                if s.get("is_default") == 1
+                and s.get("platform") == "whatsapp"
+            ),
+            None,
+        )
+        if default_sub is None:
+            return
+        default_old_cursor, default_new_cursor, by_task = (
+            _kb.claim_unseen_events_for_default_sub(
+                conn, kinds=DEFAULT_NOTIFY_KINDS,
+            )
+        )
+        if not by_task:
+            return
+        for real_task_id, evs in by_task.items():
+            real_task = _kb.get_task(conn, real_task_id)
+            deliveries.append({
+                "sub": default_sub,
+                "old_cursor": default_old_cursor,
+                "cursor": default_new_cursor,
+                "events": evs,
+                "task": real_task,
+                "board": slug,
+                "_default_sub": True,
+                "_default_template": default_target["template"],
+            })
+    except Exception as exc:
+        logger.debug(
+            "kanban notifier: default sub claim failed for board %s: %s",
+            slug, exc,
+        )
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -189,6 +424,19 @@ class GatewayKanbanWatchersMixin:
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
+
+        # Install / refresh the sentinel default WhatsApp subscription
+        # (task t_1b1c730a). Idempotent: the underlying
+        # ``ensure_default_notify_sub`` upserts on the (task_id,
+        # platform, chat_id, thread_id) PK, so a fresh DB and an
+        # already-installed row both end up in the same state. The same
+        # call runs on every tick below so a config edit (flip
+        # ``kanban.notifications.enabled`` from false to true) takes
+        # effect without a gateway restart.
+        try:
+            await asyncio.to_thread(_install_default_notify_sub_from_config, cfg)
+        except Exception as exc:
+            logger.warning("kanban notifier: default sub installer raised: %s", exc)
 
         while self._running:
             try:
@@ -287,6 +535,52 @@ class GatewayKanbanWatchersMixin:
                                 })
                         finally:
                             conn.close()
+
+                    # Default WhatsApp subscription broadcast (task
+                    # t_1b1c730a): one sentinel row subscribes to status
+                    # changes (``blocked`` / ``awaiting_clarification`` /
+                    # ``review``) for *every* card. The cursor is global
+                    # (advanced atomically inside
+                    # ``claim_unseen_events_for_default_sub``), so the
+                    # post-delivery advance/unsub tail of the per-task
+                    # delivery loop is skipped via the ``_default_sub``
+                    # flag. ``task`` is the *real* task being notified
+                    # about (so the render branches have a title to
+                    # format), while ``sub["task_id"]`` stays
+                    # ``__default__`` so the failure-counter key is the
+                    # default sub's identity (one key regardless of how
+                    # many distinct tasks fire in a tick).
+                    if not seen_db_paths:
+                        # No board slug was reached in the loop above
+                        # (empty boards list, every board skipped as a
+                        # duplicate, or every open failed) — use the
+                        # default board slug for the default-sub pass.
+                        _default_sub_collect_for_slug(
+                            _kb.DEFAULT_BOARD, cfg, active_platforms,
+                            deliveries,
+                        )
+                    else:
+                        # The default sub lives in one DB (the active
+                        # board) — even when multiple boards exist, the
+                        # sentinel row is installed in the default one
+                        # by ``_install_default_notify_sub_from_config``
+                        # (which calls ``_kb.connect()`` without a
+                        # ``board=`` arg). Use the first slug we
+                        # successfully opened above as the read target.
+                        first_slug = next(iter(seen_db_paths), _kb.DEFAULT_BOARD)
+                        # ``first_slug`` here is the resolved DB path,
+                        # not the slug string — recover the slug from
+                        # the board metadata we already enumerated.
+                        _slug_for_default_sub = _kb.DEFAULT_BOARD
+                        for board_meta in boards:
+                            _slug_for_default_sub = (
+                                board_meta.get("slug") or _kb.DEFAULT_BOARD
+                            )
+                            break
+                        _default_sub_collect_for_slug(
+                            _slug_for_default_sub, cfg, active_platforms,
+                            deliveries,
+                        )
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
@@ -374,8 +668,63 @@ class GatewayKanbanWatchersMixin:
                                 f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "awaiting_clarification":
+                            # Specifier parked the card in awaiting_clarification
+                            # and may have written a question payload; surface the
+                            # first question so the operator knows what to answer.
+                            qline = ""
+                            payload = ev.payload or {}
+                            qs = payload.get("questions") or payload.get("clarification_questions")
+                            if isinstance(qs, list) and qs:
+                                qline = f"\nQ: {str(qs[0])[:200]}"
+                            msg = (
+                                f"❓ {tag}Kanban {sub['task_id']} awaiting clarification{qline}"
+                            )
+                        elif kind == "review":
+                            # PR / change surfaced for review — link back to the
+                            # task body if the worker attached one.
+                            link = ""
+                            payload = ev.payload or {}
+                            url = payload.get("url") or payload.get("pr_url")
+                            if url:
+                                link = f"\n{str(url)[:200]}"
+                            msg = (
+                                f"👀 {tag}Kanban {sub['task_id']} ready for review{link}"
+                            )
                         else:
                             continue
+                        # Default-sub broadcasts (task t_1b1c730a) override the
+                        # canned ``msg`` above with the user-configurable
+                        # notify template. The render only fires for kinds the
+                        # default sub forwards (``blocked`` /
+                        # ``awaiting_clarification`` / ``review``); for other
+                        # kinds the loop's ``continue`` already discarded them
+                        # by the time we get here.
+                        if d.get("_default_sub"):
+                            template = d.get("_default_template") or ""
+                            workspace_path = (
+                                task.workspace_path if task and task.workspace_path else ""
+                            )
+                            block_reason = ""
+                            if ev.payload:
+                                block_reason = str(
+                                    ev.payload.get("reason")
+                                    or ev.payload.get("comment")
+                                    or ""
+                                )[:160]
+                            comment_excerpt = ""
+                            if ev.payload and ev.payload.get("comment_excerpt"):
+                                comment_excerpt = str(ev.payload["comment_excerpt"])[:200]
+                            fields = _default_sub_template_fields(
+                                template,
+                                task_id=sub["task_id"],
+                                title=title,
+                                new_status=kind,
+                                block_reason=block_reason,
+                                workspace_path=workspace_path,
+                                comment_excerpt=comment_excerpt,
+                            )
+                            msg = _render_notify_template(template, fields)
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
@@ -431,16 +780,31 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                # Don't drop the default sub on adapter failure
+                                # — the user did not install it manually, the
+                                # gateway did, and the next config reload or
+                                # gateway restart would reinstall it anyway.
+                                # Keep the sentinel row + count; let it ride
+                                # out the failure window.
+                                if not d.get("_default_sub"):
+                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
-                                )
+                                # Skip the rewind for the default sub too —
+                                # its cursor advanced across all tasks in one
+                                # atomic claim, so rewinding would unclaim
+                                # events other deliveries have already moved
+                                # past. Re-delivery happens on the next
+                                # gateway restart (cursor resets to whatever
+                                # the new install observes).
+                                if not d.get("_default_sub"):
+                                    await asyncio.to_thread(
+                                        self._kanban_rewind,
+                                        sub,
+                                        d["cursor"],
+                                        d.get("old_cursor", 0),
+                                        board_slug,
+                                    )
                             # Rewind the pre-send claim on transient failure so
                             # a later tick can retry. After too many failures,
                             # dropping the subscription is the terminal action.
@@ -449,6 +813,17 @@ class GatewayKanbanWatchersMixin:
                         # All events delivered; advance cursor. The cursor
                         # is the dedup mechanism — it prevents re-delivery
                         # of the same event on subsequent ticks.
+                        #
+                        # Default-sub broadcasts (task t_1b1c730a) skip
+                        # this advance + the unsub tail: their cursor was
+                        # already advanced atomically inside
+                        # ``claim_unseen_events_for_default_sub`` (one
+                        # global cursor for every task), and the sentinel
+                        # row is meant to live forever — it isn't a
+                        # per-task subscription that should disappear
+                        # when the task reaches ``done``/``archived``.
+                        if d.get("_default_sub"):
+                            continue
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )

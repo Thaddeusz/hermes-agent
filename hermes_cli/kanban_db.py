@@ -2188,6 +2188,7 @@ _REBUILD_SPECS = {
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " is_default INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
