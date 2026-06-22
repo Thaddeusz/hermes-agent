@@ -2443,6 +2443,73 @@ DEFAULT_CONFIG = {
                 "cli": {"enabled": False},
             },
         },
+        # Interactive triage clarification (task t_a121beda). When the
+        # specifier finds a task that needs human input to flesh out
+        # (missing credentials, ambiguous scope, paywalled source, etc.)
+        # it parks the card in ``status='awaiting_clarification'`` and
+        # writes the question payload to four task-level columns. This
+        # block is the operator-side policy + delivery config that
+        # controls when and how the question gets surfaced, and what
+        # happens if the operator never responds.
+        #
+        # The watcher is a separate card (t_e647d476) — the config block
+        # here is the schema + v1 defaults only. Flipping ``enabled``
+        # to ``True`` without the watcher shipped is a no-op; the
+        # specifier still parks cards, they just don't surface anywhere.
+        "triage_clarify": {
+            # Master toggle. When ``False``, no questions are ever asked
+            # — the specifier's question-generation path short-circuits
+            # to the existing "skip to decompose" behaviour. Per-task
+            # override is intentionally not provided: enabling per-task
+            # would let one card opt out of the operator's global
+            # posture, which is more confusing than helpful.
+            "enabled": False,
+            # Hard cap on questions per task. Specifier MUST trim a
+            # larger question list down to this size before writing the
+            # ``clarification_questions`` column; the watcher enforces
+            # this again defensively so a buggy specifier can't render
+            # an unbounded form.
+            "max_questions": 3,
+            # Default days before a parked card times out. A card with
+            # no per-task ``clarification_timeout_days`` override falls
+            # through to this value when the watcher evaluates the
+            # deadline. ``7`` matches the cadence most operators want:
+            # long enough to notice a parked card on a slow week, short
+            # enough that a stale question doesn't accumulate forever.
+            "timeout_days": 7,
+            # What to do when the deadline expires without an answer.
+            # ``skip_to_decompose``: drop the questions, fold the spec
+            # body with whatever the specifier inferred, and let the
+            # decomposer proceed. ``leave_in_awaiting``: keep the card
+            # parked so the operator can see "you owe me" at a glance.
+            # The watcher translates this enum into a status transition
+            # + optional event-log annotation.
+            "on_timeout": "skip_to_decompose",
+            # Delivery config for the question payload. Each channel
+            # has its own ``enabled`` flag so individual surfaces can
+            # be muted without affecting the others — same shape as
+            # ``kanban.notifications.destinations``. Unknown channels
+            # here are dropped with a warning.
+            "delivery": {
+                # WhatsApp self-chat: drop the question into the same
+                # chat where the operator runs ``/sethome``, so it shows
+                # up alongside agent notifications. ``recipient`` is
+                # the phone number; empty string = fall through to the
+                # gateway's default self-chat target.
+                "whatsapp": {
+                    "enabled": False,
+                    "recipient": "",
+                },
+                # CLI: render the question on the next ``/kanban show``
+                # / dashboard view. Enabled by default because it has
+                # no external dependencies — turning this off would
+                # mean operators only see parked cards if they also
+                # have whatsapp on, which is too easy to misconfigure.
+                "cli": {
+                    "enabled": True,
+                },
+            },
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -5892,6 +5959,51 @@ def _validate_kanban_notifications_config(config: Dict[str, Any]) -> None:
 # Public alias for the validator so tests can exercise it directly
 # without re-implementing the validation contract.
 validate_kanban_notifications_config = _validate_kanban_notifications_config
+
+
+def get_triage_clarify_config() -> Dict[str, Any]:
+    """Return the merged ``kanban.triage_clarify`` config block.
+
+    Two-step merge:
+      1. Start with ``DEFAULT_CONFIG[\"kanban\"][\"triage_clarify\"]`` so
+         every documented key is present even when the user has not
+         overridden the block at all.
+      2. Overlay whatever ``kanban.triage_clarify`` the user wrote in
+         ``~/.hermes/config.yaml``.
+
+    This mirrors the existing kanban-notifications accessor shape:
+    callers should never have to think about which keys are defaults
+    vs user overrides, and partial overrides (e.g. only
+    ``delivery.whatsapp`` set) must not wipe the sibling channel's
+    defaults. ``_deep_merge`` recurses into nested dicts so the
+    per-channel merge works regardless of whether the user touched
+    ``delivery`` or only one channel under it.
+
+    Returns a fresh dict on every call so callers can mutate freely
+    without poisoning later reads.
+    """
+    user_block: Dict[str, Any] = {}
+    try:
+        full = load_config()
+        kanban_cfg = full.get("kanban") if isinstance(full, dict) else None
+        if isinstance(kanban_cfg, dict):
+            tc = kanban_cfg.get("triage_clarify")
+            if isinstance(tc, dict):
+                user_block = tc
+    except Exception:
+        # Config loading is best-effort: if the user's YAML is broken
+        # (missing file, syntax error, etc.) we still want to return the
+        # documented defaults so the rest of the pipeline can boot.
+        # The actual parse failure is already logged deeper in the
+        # stack by ``_warn_config_parse_failure``.
+        user_block = {}
+
+    defaults_block = DEFAULT_CONFIG["kanban"]["triage_clarify"]
+    merged = _deep_merge(
+        copy.deepcopy(defaults_block),
+        copy.deepcopy(user_block),
+    )
+    return merged
 
 
 def terminal_config_env_var_for_key(key: str) -> Optional[str]:

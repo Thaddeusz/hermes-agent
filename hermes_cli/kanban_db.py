@@ -97,9 +97,26 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+# ``awaiting_clarification`` (task t_a121beda) sits between ``scheduled`` and
+# ``ready`` in the lifecycle: the specifier parks a card there while it waits
+# on the operator to answer clarification questions, then promotes the card
+# back to ``triage`` with the answers folded into the body. Added to the set
+# so any status column guard / claim filter accepts it; positional order in
+# the set literal is irrelevant (sets are unordered) but the docstring is
+# pinned here for the next reader.
+VALID_STATUSES = {"triage", "todo", "scheduled", "awaiting_clarification", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "awaiting_clarification"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+# Belt-and-braces: statuses the dispatcher / auto-pipeline must NEVER claim.
+# The actual claim queries filter on ``status = 'ready'`` for spawn,
+# ``status IN ('todo', 'blocked')`` for recompute, ``status = 'running'``
+# for reclaim — none of those naturally visit these — but if a future code
+# path diffs or normalises a status set (e.g. a "move stuck card to
+# <status>" heuristic), this constant is the single source of truth to
+# check. ``awaiting_clarification`` is the only entry today; ``ideas`` (the
+# other user-only parking column) lives upstream on a feature branch and
+# would also belong here when merged.
+DISPATCHER_SKIPPED_STATUSES = frozenset({"awaiting_clarification"})
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -836,6 +853,17 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Triage-clarification payload (task t_a121beda). The specifier parks a
+    # card in ``status='awaiting_clarification'`` and writes these four
+    # columns so the operator's answer-submission UI can render the
+    # questions, persist the answers, and compute the timeout deadline.
+    # All four default to ``None`` on rows predating the migration; see
+    # :func:`Task.from_row` for the lenient-JSON handling on the list-shaped
+    # ones.
+    clarification_questions: Optional[list] = None
+    clarification_answers: Optional[list] = None
+    clarification_asked_at: Optional[int] = None
+    clarification_timeout_days: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -849,6 +877,21 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        # Triage-clarification columns: lenient parse, list-only. A corrupt
+        # row (manual SQL edit, partial write, schema-drift from a future
+        # code path that stores a JSON object instead of a list) returns
+        # ``None`` instead of crashing the dispatcher the next time it
+        # iterates the board — same defensive pattern as ``skills`` above.
+        questions_value = (
+            _parse_json_list_field(row["clarification_questions"])
+            if "clarification_questions" in keys
+            else None
+        )
+        answers_value = (
+            _parse_json_list_field(row["clarification_answers"])
+            if "clarification_answers" in keys
+            else None
+        )
         return cls(
             id=row["id"],
             title=row["title"],
@@ -910,6 +953,16 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            clarification_questions=questions_value,
+            clarification_answers=answers_value,
+            clarification_asked_at=(
+                row["clarification_asked_at"] if "clarification_asked_at" in keys
+                else None
+            ),
+            clarification_timeout_days=(
+                row["clarification_timeout_days"] if "clarification_timeout_days" in keys
+                else None
             ),
         )
 
@@ -1071,7 +1124,26 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Triage-clarification payload (t_a121beda). The specifier parks a
+    -- card in ``status='awaiting_clarification'`` and writes these four
+    -- columns so the operator's answer-submission UI can render the
+    -- questions, persist the answers, and compute the timeout deadline.
+    -- All four are NULL on rows predating the migration; the additive
+    -- ALTER below backfills them lazily so an old board loads cleanly
+    -- without an export/import.
+    --
+    -- ``clarification_questions`` is a JSON array of
+    -- ``{id, question, why_we_ask}`` dicts; ``clarification_answers`` is
+    -- the same shape with an additional ``answer`` field per item.
+    -- ``clarification_asked_at`` is the unix timestamp at which the
+    -- specifier first parked the card. ``clarification_timeout_days`` is
+    -- the per-task override of ``kanban.triage_clarify.timeout_days``;
+    -- NULL = fall through to the watcher layer's config default.
+    clarification_questions    TEXT,
+    clarification_answers      TEXT,
+    clarification_asked_at     INTEGER,
+    clarification_timeout_days INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1764,6 +1836,30 @@ def _add_column_if_missing(
         raise
 
 
+def _parse_json_list_field(raw: Any) -> Optional[list]:
+    """Leniently parse a JSON-list column from a task row.
+
+    Returns the decoded list when ``raw`` is a non-empty JSON array, and
+    ``None`` for empty / NULL / malformed / non-list payloads. The
+    ``None``-on-bad-input contract mirrors what :meth:`Task.from_row` does
+    for the ``skills`` column: a corrupt row must not crash the dispatcher
+    the next time it iterates the board. Used by the triage-clarification
+    columns (``clarification_questions`` / ``clarification_answers``) so
+    that a manual SQL edit, a partial write, or a future code path that
+    accidentally stores a JSON object instead of a list all degrade to
+    ``None`` instead of raising.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return parsed
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -1883,6 +1979,35 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    # Triage-clarification payload columns (task t_a121beda). The specifier
+    # parks a card in ``status='awaiting_clarification'`` and writes these
+    # four columns; all default to NULL on legacy rows so an old board
+    # loads cleanly without backfill. The ``_parse_json_list_field`` helper
+    # in :meth:`Task.from_row` tolerates these columns being missing
+    # entirely (old DBs from before this migration), so the
+    # ``PRAGMA table_info`` snapshot above is the single source of truth
+    # for whether to add each one.
+    if "clarification_questions" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "clarification_questions",
+            "clarification_questions TEXT",
+        )
+    if "clarification_answers" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "clarification_answers",
+            "clarification_answers TEXT",
+        )
+    if "clarification_asked_at" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "clarification_asked_at",
+            "clarification_asked_at INTEGER",
+        )
+    if "clarification_timeout_days" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "clarification_timeout_days",
+            "clarification_timeout_days INTEGER",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -1922,6 +2047,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
+            )
+        # ``is_default`` flags the sentinel subscription row installed by
+        # the gateway's default-WhatsApp-sub hook (task t_1b1c730a). The
+        # sentinel uses ``task_id = "__default__"`` (a constant that can
+        # never collide with a real task_id) and ``is_default = 1`` so
+        # ``list_notify_subs(include_default=False)`` can hide it from
+        # ``notify-list`` output by default — the user doesn't manage
+        # this row by hand, the gateway does. Older rows get 0 via the
+        # DEFAULT, so this migration is backwards-compatible.
+        if "is_default" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "is_default",
+                "is_default INTEGER NOT NULL DEFAULT 0",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -2398,6 +2538,18 @@ def create_task(
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 elif triage:
                     task_status = "triage"
+                elif initial_status == "awaiting_clarification":
+                    # Specifier parks a card directly in
+                    # ``awaiting_clarification`` at creation time so the
+                    # first act of the pipeline can be to ask the operator
+                    # questions without a create-then-update race. Parent
+                    # ids still need to be valid so the eventual link rows
+                    # don't dangle.
+                    task_status = "awaiting_clarification"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 else:
                     task_status = "ready"
                     if parents:
@@ -2494,6 +2646,85 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def set_task_clarification(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    questions: Optional[list] = None,
+    answers: Optional[list] = None,
+    asked_at: Optional[int] = None,
+    timeout_days: Optional[int] = None,
+) -> bool:
+    """Write one or more triage-clarification columns on a task.
+
+    Partial-update helper: only kwargs that are not ``None`` are touched,
+    so the answer-submission UI can call this with just ``answers=``
+    without clobbering the question payload, the ask timestamp, or the
+    per-task timeout override. Returns ``True`` if the task exists (the
+    UPDATE matched a row), ``False`` otherwise — a typo in ``task_id``
+    surfaces as ``False`` so callers can render "task not found" rather
+    than a silent success.
+
+    The caller passes native Python ``list`` objects for ``questions`` /
+    ``answers``; this function serialises them to JSON so a round-trip
+    through :meth:`Task.from_row` returns native lists again. The two
+    list-shaped columns accept any JSON-serialisable payload (the
+    specifier writes ``{id, question, why_we_ask}`` dicts; the
+    answer-submission UI writes the same with an extra ``answer`` field).
+    """
+    sets: list[str] = []
+    params: list[Any] = []
+    if questions is not None:
+        sets.append("clarification_questions = ?")
+        params.append(json.dumps(questions))
+    if answers is not None:
+        sets.append("clarification_answers = ?")
+        params.append(json.dumps(answers))
+    if asked_at is not None:
+        sets.append("clarification_asked_at = ?")
+        params.append(int(asked_at))
+    if timeout_days is not None:
+        sets.append("clarification_timeout_days = ?")
+        params.append(int(timeout_days))
+    if not sets:
+        # All kwargs default to ``None`` — still want to surface "task
+        # not found" vs "no-op" distinctly, so probe existence first
+        # instead of letting an empty UPDATE silently report success.
+        row = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return row is not None
+    params.append(task_id)
+    cur = conn.execute(
+        f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+        params,
+    )
+    return cur.rowcount > 0
+
+
+def clear_task_clarification(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Reset all four triage-clarification columns to NULL.
+
+    Called by the specifier when it promotes a card out of
+    ``status='awaiting_clarification'`` back to ``triage`` so the next
+    clarification cycle starts clean (otherwise a re-park would inherit
+    stale questions from the previous cycle). Returns ``True`` if the
+    task exists (the UPDATE matched a row), ``False`` otherwise — same
+    shape as :func:`set_task_clarification` so callers can rely on a
+    consistent "task not found" signal.
+    """
+    cur = conn.execute(
+        "UPDATE tasks SET "
+        "clarification_questions = NULL, "
+        "clarification_answers = NULL, "
+        "clarification_asked_at = NULL, "
+        "clarification_timeout_days = NULL "
+        "WHERE id = ?",
+        (task_id,),
+    )
+    return cur.rowcount > 0
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -7868,14 +8099,191 @@ def add_notify_sub(
 
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
+    include_default: bool = False,
 ) -> list[dict]:
+    """Return notify subscription rows.
+
+    By default the sentinel default-WhatsApp-sub row (``task_id =
+    "__default__"``, ``is_default = 1``) is hidden — the user does not
+    manage it by hand, the gateway installs/removes it from
+    ``kanban.notifications`` config. Pass ``include_default=True`` to
+    surface it; tests use that flag to assert its existence.
+    """
+    where = []
+    params: list = []
     if task_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
+        where.append("task_id = ?")
+        params.append(task_id)
+    if not include_default:
+        where.append("(is_default IS NULL OR is_default = 0)")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = conn.execute(
+        f"SELECT * FROM kanban_notify_subs {where_sql}", params,
+    ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Default WhatsApp notify subscription (task t_1b1c730a)
+# ---------------------------------------------------------------------------
+#
+# The gateway installs one sentinel row (``task_id = "__default__"``,
+# ``is_default = 1``) at startup whenever ``kanban.notifications.enabled``
+# is true and a destination (currently WhatsApp) is configured. The row
+# subscribes to *every* card's status change events — distinct from the
+# per-task ``kanban_notify-subscribe`` rows the user manages by hand. The
+# default sub's cursor is global (``task_events.id > cursor`` across all
+# task_ids), so a single broadcast scanner advances it once and lets the
+# existing per-event delivery loop fire one WhatsApp message per matching
+# event. Per-task rows have their own cursors and continue to work in
+# parallel — the two systems are deliberately independent (the user's
+# memory rule: "no shared cursor between default and explicit subs").
+DEFAULT_NOTIFY_SUB_TASK_ID = "__default__"
+
+
+def ensure_default_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> bool:
+    """Install or refresh the sentinel default subscription row.
+
+    Idempotent: safe to call on every gateway tick. Returns True if the
+    row exists at exit (always true after the first successful call),
+    False if insertion failed.
+    """
+    if not chat_id:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs (
+                task_id, platform, chat_id, thread_id, user_id,
+                notifier_profile, created_at, last_event_id, is_default
+            ) VALUES (?, ?, ?, ?, NULL, ?, ?, 0, 1)
+            ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE
+              SET is_default = 1,
+                  notifier_profile = COALESCE(
+                      excluded.notifier_profile,
+                      kanban_notify_subs.notifier_profile
+                  )
+            """,
+            (
+                DEFAULT_NOTIFY_SUB_TASK_ID,
+                platform,
+                chat_id,
+                thread_id or "",
+                notifier_profile,
+                now,
+            ),
+        )
+    return True
+
+
+def remove_default_notify_sub(conn: sqlite3.Connection) -> bool:
+    """Remove the sentinel default subscription row (if any). Idempotent."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ?",
+            (DEFAULT_NOTIFY_SUB_TASK_ID,),
+        )
+    return cur.rowcount > 0
+
+
+def has_default_notify_sub(conn: sqlite3.Connection) -> bool:
+    """Return True iff the sentinel default subscription row is installed.
+
+    Pure read; no transaction needed.
+    """
+    row = conn.execute(
+        "SELECT 1 AS x FROM kanban_notify_subs WHERE task_id = ?",
+        (DEFAULT_NOTIFY_SUB_TASK_ID,),
+    ).fetchone()
+    return row is not None
+
+
+def claim_unseen_events_for_default_sub(
+    conn: sqlite3.Connection,
+    *,
+    kinds: Optional[Iterable[str]] = None,
+) -> tuple[int, int, dict[str, list]]:
+    """Atomically claim unseen status-change events for the default sub.
+
+    Distinct from :func:`claim_unseen_events_for_sub` in two ways:
+      - **scope**: scans ``task_events`` across *all* task_ids, not one
+        per-task cursor.
+      - **return shape**: returns ``(old_cursor, new_cursor, by_task_id)``
+        where ``by_task_id`` is a mapping of ``task_id -> [Event, ...]``
+        so the caller can iterate per task to fetch its title and render
+        a single delivery per task (matching the user-facing expectation
+        of "one WhatsApp message per card transition", not one per
+        event-row).
+
+    Filters on ``kind IN kinds`` (default: ``("blocked",
+    "awaiting_clarification", "review")`` — the spec's narrower set,
+    distinct from the terminal-event set used by per-task subs).
+    Atomic: ``BEGIN IMMEDIATE`` advances ``last_event_id`` so concurrent
+    watcher processes serialize on the writer lock and only one of them
+    claims a given event range.
+
+    Returns ``(0, 0, {})`` when no default sub is installed (a fresh DB
+    before the gateway boot hook has run) — callers should treat that
+    as "nothing to do" without raising.
+    """
+    if kinds is None:
+        kinds = ("blocked", "awaiting_clarification", "review")
+    kind_list = list(kinds)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ?",
+            (DEFAULT_NOTIFY_SUB_TASK_ID,),
+        ).fetchone()
+        if row is None:
+            return 0, 0, {}
+        old_cursor = int(row["last_event_id"])
+        q = (
+            "SELECT * FROM task_events WHERE id > ? "
+            + ("AND kind IN (" + ",".join("?" * len(kind_list)) + ") " if kind_list else "")
+            + "ORDER BY id ASC"
+        )
+        params: list[Any] = [old_cursor]
+        if kind_list:
+            params.extend(kind_list)
+        rows = conn.execute(q, params).fetchall()
+        if not rows:
+            return old_cursor, old_cursor, {}
+        new_cursor = int(max(int(r["id"]) for r in rows))
+        by_task: dict[str, list] = {}
+        max_id_seen = old_cursor
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            ev = Event(
+                id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                payload=payload, created_at=r["created_at"],
+                run_id=(
+                    int(r["run_id"])
+                    if "run_id" in r.keys() and r["run_id"] is not None
+                    else None
+                ),
+            )
+            by_task.setdefault(r["task_id"], []).append(ev)
+            max_id_seen = max(max_id_seen, int(r["id"]))
+        # CAS-advance the cursor so a parallel watcher's later claim
+        # doesn't re-deliver events this call already took.
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND last_event_id = ?",
+            (new_cursor, DEFAULT_NOTIFY_SUB_TASK_ID, old_cursor),
+        )
+        return old_cursor, new_cursor, by_task
 
 
 def remove_notify_sub(
