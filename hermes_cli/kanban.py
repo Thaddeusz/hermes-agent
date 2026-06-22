@@ -842,7 +842,64 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
-                      help="Delete worker log files older than N days (default: 30)")
+                      help="Delete worker log files older than N days for terminal tasks (default: 30)")
+
+    # --- triage --- (interactive clarification cycle — task t_a6bc4b73)
+    # The companion to ``specify`` / ``decompose``: this command is what
+    # the operator runs AFTER the specifier parked the task in
+    # ``status=awaiting_clarification`` with a list of questions in
+    # ``clarification_questions``. It folds the answers back into the
+    # body and flips the status to ``triage`` so the auto-decomposer
+    # picks the card up on its next tick.
+    p_triage = sub.add_parser(
+        "triage",
+        help="Interact with a triage-column task — fold clarification "
+             "answers back into a parked card so the auto-decomposer can "
+             "resume it.",
+    )
+    p_triage.add_argument(
+        "--answer",
+        dest="answer_task_id",
+        metavar="TASK_ID",
+        help="Fold clarification answers back into TASK_ID and release it "
+             "for decomposition. Use together with --q, --answer-file, or "
+             "--stdin to provide the answers.",
+    )
+    p_triage.add_argument(
+        "-q", "--q",
+        dest="q_flags",
+        action="append",
+        default=[],
+        metavar="ID=ANSWER",
+        help="A single answer in 'id=answer' form. Repeatable; the order "
+             "does not matter (answers are merged by id, last write wins).",
+    )
+    p_triage.add_argument(
+        "--answer-file",
+        default=None,
+        metavar="PATH",
+        help="Read answers from a JSON file (array of {id, answer} dicts, "
+             "or {answers: [...]} wrapper).",
+    )
+    p_triage.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read answers as a JSON array from stdin (must be opted into "
+             "explicitly so a non-interactive shell doesn't silently "
+             "consume stdin).",
+    )
+    p_triage.add_argument(
+        "--author",
+        default=None,
+        help="Author name recorded on the audit comment (default: "
+             "$HERMES_PROFILE or 'user').",
+    )
+    p_triage.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a single JSON object on success (machine-readable "
+             "handoff for scripts / chat-platform bots).",
+    )
 
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
@@ -959,6 +1016,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "triage":   _cmd_triage,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2706,6 +2764,136 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     )
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
+
+
+def _cmd_triage(args: argparse.Namespace) -> int:
+    """Fold clarification answers back into a parked triage task.
+
+    Operator-facing counterpart to ``hermes_cli/triage_clarify.py``. When
+    the specifier parks a card in ``status=awaiting_clarification`` with
+    a JSON payload of questions in ``clarification_questions``, the
+    operator hands answers back through this command and the card is
+    flipped back to ``status='triage'`` so the auto-decomposer picks it
+    up on its next tick.
+
+    Three input modes are supported and may be combined in one call:
+
+      * ``--q ID=ANSWER`` (repeatable) for ad-hoc CLI use.
+      * ``--answer-file PATH`` pointing at a JSON array (the typical
+        "paste into a file" path; the file can also be a wrapped object
+        ``{"answers": [...]}``).
+      * ``--stdin`` to pipe a JSON array through the terminal. Must be
+        opted into explicitly so a non-interactive shell never silently
+        consumes stdin.
+
+    The body folding, status flip, and audit comment are handled by
+    :func:`kanban_db.fold_clarification_answers` — this layer only
+    parses input and renders CLI output.
+
+    Webhook half (TODO — separate card): when a chat-platform webhook
+    handler exists, add a small dispatcher branch that recognises the
+    ``awaiting_clarification`` task id in the inbound message and
+    routes to :func:`hermes_cli.kanban_clarify_answers.submit_clarification_answers`
+    with the same answer payload. The function boundary is already in
+    place so the webhook card can be a thin wrapper without touching
+    the DB layer. Function boundary signature (already shipped):
+    ``submit_clarification_answers(task_id, answers, author=None)``.
+    """
+    from hermes_cli import kanban_clarify_answers as kca
+
+    task_id = getattr(args, "answer_task_id", None)
+    if not task_id:
+        print(
+            "kanban: triage requires --answer <TASK_ID> (the task parked in "
+            "awaiting_clarification). Run `hermes kanban triage -h` for the "
+            "full flag surface.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Decide which input sources are active. Mixing is allowed — a file
+    # with defaults plus one --q override is a common pattern.
+    sources_used = []
+    if getattr(args, "q_flags", None):
+        sources_used.append("--q")
+    if getattr(args, "answer_file", None):
+        sources_used.append("--answer-file")
+    if getattr(args, "stdin", False):
+        sources_used.append("--stdin")
+    if not sources_used:
+        print(
+            "kanban: triage --answer needs at least one of --q, "
+            "--answer-file, or --stdin to provide the answers.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        # Build the per-source batches in priority order: file (defaults)
+        # first, then stdin, then --q last so a CLI flag always wins over
+        # a bulk source. This matches the operator's mental model —
+        # "the file is my starting point, --q is my override".
+        batches = []
+        if getattr(args, "answer_file", None):
+            batches.append(kca._parse_answer_file(args.answer_file))
+        if getattr(args, "stdin", False):
+            batches.append(kca._parse_stdin_json())
+        if getattr(args, "q_flags", None):
+            batches.append(kca._parse_q_flags(args.q_flags))
+        answers = kca._merge_answer_sources(*batches)
+    except kca.ClarifyAnswerParseError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+
+    author = args.author or _profile_author()
+    want_json = bool(getattr(args, "json", False))
+
+    try:
+        new_body = kca.submit_clarification_answers(
+            task_id, answers, author=author,
+        )
+    except ValueError as exc:
+        # DB-layer validation failure (empty list, malformed entry that
+        # somehow slipped past the parser). Treat as user error.
+        print(f"kanban: triage --answer {task_id}: {exc}", file=sys.stderr)
+        return 2
+
+    if new_body is None:
+        # The fold helper distinguishes "task not found / wrong state"
+        # via a None return so the CLI can render a precise message.
+        # Re-read the row to figure out which one it was — that's one
+        # extra SELECT, but it gives the operator a useful error
+        # instead of a generic "nothing happened".
+        with kb.connect_closing() as conn:
+            row = kb.get_task(conn, task_id)
+        if row is None:
+            print(
+                f"kanban: triage --answer {task_id}: task not found",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"kanban: triage --answer {task_id}: task is in "
+                f"status={row.status!r}, expected 'awaiting_clarification'. "
+                f"Answers can only be folded into a parked triage task.",
+                file=sys.stderr,
+            )
+        return 1
+
+    if want_json:
+        print(json.dumps({
+            "task_id": task_id,
+            "ok": True,
+            "answer_count": len(answers),
+            "status": "triage",
+            "body_chars": len(new_body),
+        }))
+    else:
+        print(
+            f"Folded {len(answers)} answer(s) into {task_id} → triage "
+            f"(ready for auto-decompose on next tick)"
+        )
     return 0
 
 

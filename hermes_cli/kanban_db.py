@@ -2728,6 +2728,266 @@ def clear_task_clarification(conn: sqlite3.Connection, task_id: str) -> bool:
     return cur.rowcount > 0
 
 
+# Header for the answers section that ``fold_clarification_answers``
+# appends to (and idempotently replaces on every re-run) the task body.
+# Lifted to module scope so tests + the CLI + the (future) chat webhook
+# handler all key off the same literal — drift between callers would
+# silently break the idempotency guarantee.
+_CLARIFICATIONS_HEADING = "## User clarifications"
+
+
+def fold_clarification_answers(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    answers: list[dict],
+    author: Optional[str] = None,
+) -> Optional[str]:
+    """Fold operator answers back into a parked triage task and release it.
+
+    Task ``t_a6bc4b73`` — the user-facing counterpart to the data-layer
+    foundation in t_a121beda. The specifier parks a card in
+    ``status='awaiting_clarification'`` with a JSON payload in
+    ``clarification_questions``; this function is the operator's
+    counterpart that:
+
+      1. Validates the answers list (must be a list of ``{id, answer}``
+         dicts, one per question id; extras are tolerated).
+      2. Appends a ``## User clarifications`` section to the task body
+         listing each question and its answer in question-list order
+         (so the specifier / decomposer / dispatcher see the full
+         operator input when they pick the card back up).
+         Idempotent: if the section already exists, everything from
+         the heading to EOF is replaced rather than appended.
+      3. Writes ``clarification_answers`` (preserves the question
+         payload's ``{id, question, why_we_ask}`` shape and overlays
+         ``answer`` on each entry — so the merged row carries both
+         sides for the audit log).
+      4. Flips ``status='triage'`` and NULLs ``clarification_questions``
+         + ``clarification_asked_at`` so the watcher can't re-ask and
+         the auto-decomposer picks the card up on its next tick.
+
+    Returns the new task body on success. Returns ``None`` when:
+
+      - The task does not exist.
+      - The task is not in ``status='awaiting_clarification'`` (the
+        caller is allowed to fold only parked cards — folding into a
+        non-parked task would lose answers silently).
+      - The answers list is empty or malformed (validation failure
+        is propagated as ``ValueError``; ``None`` is reserved for
+        the "task not found / wrong state" case so the CLI can render
+        a distinct error message).
+
+    The ``author`` argument is recorded on an audit comment (only when
+    the fold actually wrote something — re-folding with the same
+    answers is a no-op and gets no spam comment). ``None`` skips the
+    audit comment, useful for programmatic callers (e.g. the future
+    chat-webhook handler) that prefer to log the inbound message
+    separately.
+    """
+    if not isinstance(answers, list) or not answers:
+        raise ValueError(
+            "answers must be a non-empty list of {id, answer} dicts"
+        )
+    # Normalise to {id: answer} map so the body render and the column
+    # write both consume the same shape, regardless of input ordering.
+    by_id: dict[str, str] = {}
+    for idx, item in enumerate(answers):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"answers[{idx}] is not a dict (got {type(item).__name__})"
+            )
+        qid = item.get("id")
+        ans = item.get("answer")
+        if not isinstance(qid, str) or not qid.strip():
+            raise ValueError(
+                f"answers[{idx}].id must be a non-empty string"
+            )
+        if not isinstance(ans, str):
+            raise ValueError(
+                f"answers[{idx}].answer must be a string "
+                f"(got {type(ans).__name__})"
+            )
+        # Last-write-wins on duplicate ids; the CLI should never
+        # produce them but defensive parsing avoids corrupting the
+        # stored row if a manual --q id typo collides.
+        by_id[qid.strip()] = ans
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, status, body, clarification_questions "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["status"] != "awaiting_clarification":
+            return None
+
+        # Parse the question payload (tolerate malformed rows the same
+        # way Task.from_row does — see _parse_json_list_field).
+        questions_raw = row["clarification_questions"]
+        questions = _parse_json_list_field(questions_raw) or []
+        if not questions:
+            # No question payload: the specifier parked the card without
+            # writing what it was asking. This shouldn't happen in
+            # practice but degrade gracefully — render the answers by id
+            # only and still flip the status.
+            merged_answers = [
+                {"id": qid, "answer": ans} for qid, ans in by_id.items()
+            ]
+        else:
+            merged_answers = []
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                qid = q.get("id")
+                if not isinstance(qid, str):
+                    continue
+                ans = by_id.get(qid)
+                if ans is None:
+                    # Operator didn't answer this question — still list
+                    # it in the merged payload so the audit trail shows
+                    # the gap rather than silently dropping it.
+                    merged_answers.append({**q, "answer": None})
+                else:
+                    merged_answers.append({**q, "answer": ans})
+            # Any answers whose id isn't in the question list go at the
+            # end with the bare shape — operator provided extra context.
+            seen = {
+                q.get("id") for q in questions
+                if isinstance(q, dict) and isinstance(q.get("id"), str)
+            }
+            for qid, ans in by_id.items():
+                if qid not in seen:
+                    merged_answers.append({"id": qid, "answer": ans})
+
+        # Fold the answers into the body. Idempotency: replace any prior
+        # `## User clarifications` section so re-folds don't duplicate.
+        body = row["body"] or ""
+        new_body = _replace_or_append_clarifications_section(body, questions, by_id)
+
+        # Detect "this fold is a no-op" (same answers + same body) so
+        # we skip the audit comment + redundant UPDATE churn.
+        prev_answers_raw = conn.execute(
+            "SELECT clarification_answers FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        prev_answers_json = prev_answers_raw["clarification_answers"] if prev_answers_raw else None
+        prev_body = row["body"] or ""
+        no_change = (
+            prev_answers_json is not None
+            and json.loads(prev_answers_json) == merged_answers
+            and prev_body == new_body
+        )
+
+        if not no_change:
+            now = int(time.time())
+            conn.execute(
+                "UPDATE tasks SET "
+                "body = ?, "
+                "clarification_answers = ?, "
+                "clarification_questions = NULL, "
+                "clarification_asked_at = NULL, "
+                "status = 'triage' "
+                "WHERE id = ? AND status = 'awaiting_clarification'",
+                (new_body, json.dumps(merged_answers), task_id),
+            )
+            _append_event(
+                conn, task_id, "clarifications_folded",
+                {"answer_count": len(merged_answers), "author": author},
+            )
+            if author and author.strip():
+                # Use the raw INSERT path (not add_comment) because
+                # we're already inside write_txn — see the same pattern
+                # in specify_triage_task / decompose_triage_task.
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        author.strip(),
+                        f"CLARIFICATION_ANSWERS: folded {len(merged_answers)} answer(s) into body",
+                        now,
+                    ),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": author, "len": len(
+                        f"CLARIFICATION_ANSWERS: folded {len(merged_answers)} answer(s) into body"
+                    )},
+                )
+
+        return new_body
+
+
+def _replace_or_append_clarifications_section(
+    body: str,
+    questions: list,
+    answers_by_id: dict[str, str],
+) -> str:
+    """Replace (or append) the ``## User clarifications`` block in ``body``.
+
+    Idempotency contract: if the heading is present, everything from
+    that heading to EOF is dropped and the freshly rendered block is
+    put in its place. Re-running with the same answers therefore
+    produces a byte-identical body, and re-running with different
+    answers produces a body whose tail is replaced — never duplicated.
+    """
+    rendered = _render_clarifications_section(questions, answers_by_id)
+    if _CLARIFICATIONS_HEADING in body:
+        head, _, _ = body.partition(_CLARIFICATIONS_HEADING)
+        # Preserve any trailing newlines between the prior content and
+        # the heading so we don't collapse a `...\n\n## User ...`
+        # into `...## User ...`. The convention is one blank line
+        # between prose and the heading; we always emit a blank line
+        # before the heading in the rendered block, so strip one
+        # trailing newline from the head if it's there and let the
+        # rendered block add the canonical separator.
+        head = head.rstrip("\n")
+        if head:
+            return f"{head}\n\n{rendered}"
+        return rendered
+    if body.strip():
+        return f"{body.rstrip()}\n\n{rendered}"
+    return rendered
+
+
+def _render_clarifications_section(
+    questions: list,
+    answers_by_id: dict[str, str],
+) -> str:
+    """Render the ``## User clarifications`` markdown block.
+
+    When the question payload is available (the normal case), each
+    question is listed in question-list order with its answer inline
+    so the specifier / decomposer see both sides in one read. When
+    the question payload is missing (defensive fallback — shouldn't
+    happen via the normal specifier flow), the section lists
+    ``id: answer`` pairs only.
+    """
+    lines = [_CLARIFICATIONS_HEADING, ""]
+    if not questions:
+        for qid, ans in answers_by_id.items():
+            lines.append(f"- **{qid}**: {ans}")
+        return "\n".join(lines) + "\n"
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qid = q.get("id")
+        qtext = q.get("question") or "(question text missing)"
+        if not isinstance(qid, str):
+            lines.append(f"- {qtext}")
+            continue
+        ans = answers_by_id.get(qid)
+        if ans is None:
+            lines.append(f"- **{qid}** — {qtext}: *(no answer provided)*")
+        else:
+            lines.append(f"- **{qid}** — {qtext}: {ans}")
+    return "\n".join(lines) + "\n"
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
