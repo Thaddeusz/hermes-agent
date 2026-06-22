@@ -2384,6 +2384,65 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Status-change notifications for cards needing human attention
+        # (blocked / awaiting_clarification / review). The watcher is
+        # implemented in ``gateway/kanban_notifier.py``; this block is
+        # the schema + v1 defaults. See t_863ea8ff for the
+        # config-loader contract and t_c8be9c8d for end-to-end wiring.
+        "notifications": {
+            # Master toggle. When false, the watcher no-ops even if
+            # individual destinations below are enabled. Per-task
+            # ``kanban_notify-subscribe`` calls are unaffected — those
+            # are an independent subscription system.
+            "enabled": True,
+            # Per-status filter. Only events whose new_status is true
+            # here are forwarded. Keys not listed are treated as false
+            # (forward-compat for statuses added later).
+            "on_status": {
+                "blocked": True,
+                "awaiting_clarification": True,
+                "review": True,
+                # Not yet wired in v1; flipping to true is a no-op
+                # until the scheduler status lands in t_xxx.
+                "scheduled": False,
+            },
+            # Destination adapters. v1 ships ``whatsapp`` only;
+            # ``desktop_toast`` / ``email`` / ``cli`` are reserved
+            # blocks so v2 adapters can land without a config-shape
+            # migration. Each block carries its own ``enabled`` flag
+            # so individual destinations can be muted without
+            # affecting the others. Unknown keys here are logged as
+            # warnings and otherwise ignored (see
+            # ``_validate_kanban_notifications_config``).
+            "destinations": {
+                "whatsapp": {
+                    # Phone number in self-chat mode (the user's own
+                    # number, so notifications land on the same chat
+                    # where /sethome was run).
+                    "chat_id": "353899843924",
+                    # Optional thread/topic id for grouping. None
+                    # routes to the chat's main thread.
+                    "thread_id": None,
+                    # Which gateway profile owns the delivery. Empty
+                    # / missing falls back to the active profile.
+                    "profile": "main_profile",
+                    # Placeholders: {task_id} {title} {new_status}
+                    # {block_reason} {workspace_path}. Custom
+                    # templates render at delivery time; missing
+                    # placeholders are left blank rather than
+                    # raising.
+                    "template": (
+                        "🔔 Kanban: {task_id} {title}\n"
+                        "Status: {new_status}\n"
+                        "Reason: {block_reason}\n"
+                        "Workspace: {workspace_path}"
+                    ),
+                },
+                "desktop_toast": {"enabled": False},
+                "email": {"enabled": False},
+                "cli": {"enabled": False},
+            },
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -5701,6 +5760,140 @@ def _terminal_env_value(value: Any) -> str:
     return str(value)
 
 
+# v1 destination set for ``kanban.notifications``. Unknown destination
+# keys are logged as warnings and otherwise ignored — forward-compat for
+# v2 adapters that may land in subsequent releases (e.g. ``slack``,
+# ``discord``, ``push``). Reserved v2 entries that are accepted as
+# no-ops in v1 (``desktop_toast`` / ``email`` / ``cli``) are also
+# listed here so a user's typo gets caught instead of silently
+# double-creating a new key.
+_KNOWN_KANBAN_NOTIFICATION_DESTINATIONS: frozenset = frozenset({
+    "whatsapp",
+    "desktop_toast",
+    "email",
+    "cli",
+})
+
+# v1 on_status keys. Same forward-compat logic: keys not listed here
+# are treated as ``false`` (no forwarding) rather than raising.
+_KNOWN_KANBAN_NOTIFICATION_STATUSES: frozenset = frozenset({
+    "blocked",
+    "awaiting_clarification",
+    "review",
+    "scheduled",
+})
+
+
+def _validate_kanban_notifications_config(config: Dict[str, Any]) -> None:
+    """Validate ``config["kanban"]["notifications"]`` in place; warn, never raise.
+
+    The notifier config is forward-compat by design: missing blocks fall
+    back to v1 defaults via ``_deep_merge`` before this runs, so we only
+    need to defend against (a) values that aren't dicts where dicts are
+    expected, and (b) unknown destination / on_status keys a user
+    mistyped. Both surface as ``logger.warning`` so a typo never prevents
+    the gateway from booting — the unknown destination just won't fire
+    until v2 ships it (or the user fixes the typo).
+
+    Empty / ``None`` blocks are treated as "use defaults" and produce no
+    warning. We do NOT mutate the dict here — only validate.
+
+    Exposed publicly as ``validate_kanban_notifications_config`` so the
+    unit test can exercise it without spinning up the full loader.
+    """
+    kanban_cfg = config.get("kanban") if isinstance(config, dict) else None
+    if not isinstance(kanban_cfg, dict):
+        return
+    notif = kanban_cfg.get("notifications")
+    if not isinstance(notif, dict):
+        return
+
+    # Master toggle. Anything other than a bool coerces via
+    # ``_coerce_bool`` semantics, but warn to surface user typos
+    # (e.g. ``enabled: "yes"`` is fine; ``enabled: 1`` is not — flag it).
+    enabled = notif.get("enabled", True)
+    if not isinstance(enabled, bool):
+        logger.warning(
+            "kanban.notifications.enabled should be a bool; got %r — coercing",
+            type(enabled).__name__,
+        )
+
+    # on_status filter. Unknown status keys log a warning; missing keys
+    # default to false via the deep-merge machinery.
+    on_status = notif.get("on_status")
+    if isinstance(on_status, dict):
+        for status_key in on_status:
+            if status_key not in _KNOWN_KANBAN_NOTIFICATION_STATUSES:
+                logger.warning(
+                    "kanban.notifications.on_status.%s is not a known status "
+                    "(known: %s); ignoring",
+                    status_key,
+                    sorted(_KNOWN_KANBAN_NOTIFICATION_STATUSES),
+                )
+    elif on_status is not None:
+        logger.warning(
+            "kanban.notifications.on_status should be a mapping; got %s",
+            type(on_status).__name__,
+        )
+
+    # Destinations. Unknown keys here log a warning so v2 adapters
+    # don't accidentally fire if a user typo'd ``whatsap:`` instead of
+    # ``whatsapp:``. Reserved v2 blocks (``desktop_toast``/``email``/
+    # ``cli``) are accepted but no-op when ``enabled: false``.
+    destinations = notif.get("destinations")
+    if isinstance(destinations, dict):
+        for dest_key, dest_value in destinations.items():
+            if dest_key not in _KNOWN_KANBAN_NOTIFICATION_DESTINATIONS:
+                logger.warning(
+                    "kanban.notifications.destinations.%s is not a known "
+                    "destination (known: %s); v2 adapter may not be "
+                    "shipped yet — no notifications will fire for this key",
+                    dest_key,
+                    sorted(_KNOWN_KANBAN_NOTIFICATION_DESTINATIONS),
+                )
+                continue
+            if not isinstance(dest_value, dict):
+                logger.warning(
+                    "kanban.notifications.destinations.%s should be a "
+                    "mapping; got %s",
+                    dest_key,
+                    type(dest_value).__name__,
+                )
+    elif destinations is not None:
+        logger.warning(
+            "kanban.notifications.destinations should be a mapping; got %s",
+            type(destinations).__name__,
+        )
+
+    # Per-destination ``whatsapp`` shape check. We only warn on
+    # non-dict / wrong-type fields; missing fields are fine because
+    # the deep-merge already filled them with defaults. The full
+    # field-level validator lives in the watcher (t_9ef8b3c4) — this
+    # is just the loader-shape sanity pass.
+    if isinstance(destinations, dict):
+        wa = destinations.get("whatsapp")
+        if isinstance(wa, dict):
+            chat_id = wa.get("chat_id")
+            if chat_id is not None and not isinstance(chat_id, str):
+                logger.warning(
+                    "kanban.notifications.destinations.whatsapp.chat_id "
+                    "should be a string; got %s",
+                    type(chat_id).__name__,
+                )
+            template = wa.get("template")
+            if template is not None and not isinstance(template, str):
+                logger.warning(
+                    "kanban.notifications.destinations.whatsapp.template "
+                    "should be a string; got %s",
+                    type(template).__name__,
+                )
+
+
+# Public alias for the validator so tests can exercise it directly
+# without re-implementing the validation contract.
+validate_kanban_notifications_config = _validate_kanban_notifications_config
+
+
 def terminal_config_env_var_for_key(key: str) -> Optional[str]:
     """Return the env var mirrored by a ``terminal.*`` config key."""
     prefix = "terminal."
@@ -5815,6 +6008,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
+        # Validate v1-shaped blocks (forward-compat, warn-only) so the
+        # gateway boots cleanly even with a typo in user config. The
+        # helper is a no-op when the block is missing / wrong-type at
+        # the top level.
+        _validate_kanban_notifications_config(expanded)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
         # against the process environment, never against user-config-defined refs.
