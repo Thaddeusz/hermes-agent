@@ -715,9 +715,20 @@ class GatewayKanbanWatchersMixin:
                             comment_excerpt = ""
                             if ev.payload and ev.payload.get("comment_excerpt"):
                                 comment_excerpt = str(ev.payload["comment_excerpt"])[:200]
+                            # ``task`` here is the *real* task being
+                            # notified about (the per-task collect loop
+                            # stores the real task in ``d["task"]`` when
+                            # synthesizing the default-sub delivery). The
+                            # ``sub`` dict still carries the sentinel
+                            # ``__default__`` task_id, so use
+                            # ``task.id`` directly to render the real
+                            # id in the message body.
+                            real_task_id = (
+                                task.id if task and task.id else sub["task_id"]
+                            )
                             fields = _default_sub_template_fields(
                                 template,
-                                task_id=sub["task_id"],
+                                task_id=real_task_id,
                                 title=title,
                                 new_status=kind,
                                 block_reason=block_reason,
